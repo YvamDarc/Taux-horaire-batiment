@@ -1,7 +1,17 @@
 import io
+import datetime as dt
+
 import streamlit as st
 import pandas as pd
 import altair as alt
+
+from docx import Document
+from docx.shared import Pt
+from docx.enum.text import WD_ALIGN_PARAGRAPH
+
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.units import cm
+from reportlab.pdfgen import canvas
 
 st.set_page_config(
     page_title="Rapprochement CA / Achats / Heures – Bâtiment",
@@ -19,7 +29,7 @@ def fmt_eur(x):
 
 def fmt_pct(x):
     try:
-        return f"{float(x)*100:.1f} %"
+        return f"{float(x) * 100:.1f} %"
     except Exception:
         return ""
 
@@ -32,7 +42,6 @@ def normalize_hours_df(df: pd.DataFrame) -> pd.DataFrame:
         df = pd.DataFrame([{"Personne": "", "Heures": 0.0, "Coef_production": 0.0}])
 
     out = df.copy()
-    # Garantir colonnes
     for col in ["Personne", "Heures", "Coef_production"]:
         if col not in out.columns:
             out[col] = "" if col == "Personne" else 0.0
@@ -105,7 +114,7 @@ def make_template_excel_bytes() -> bytes:
         df_n1.to_excel(writer, index=False, sheet_name="N-1")
     return buf.getvalue()
 
-def read_hours_sheet(xls: pd.ExcelFile, sheet_name: str) -> pd.DataFrame | None:
+def read_hours_sheet(xls: pd.ExcelFile, sheet_name: str):
     if sheet_name not in xls.sheet_names:
         return None
     df = pd.read_excel(xls, sheet_name=sheet_name)
@@ -113,8 +122,7 @@ def read_hours_sheet(xls: pd.ExcelFile, sheet_name: str) -> pd.DataFrame | None:
     missing = set(REQUIRED_COLS) - set(df.columns)
     if missing:
         raise ValueError(f"Onglet '{sheet_name}' : colonnes manquantes: {', '.join(sorted(missing))}")
-    df = df[REQUIRED_COLS].copy()
-    return df
+    return df[REQUIRED_COLS].copy()
 
 def load_hours_from_excel(uploaded_file):
     """Attend un xlsx avec onglet N (obligatoire) + onglet N-1 (optionnel)."""
@@ -122,8 +130,246 @@ def load_hours_from_excel(uploaded_file):
     df_n = read_hours_sheet(xls, "N")
     if df_n is None:
         raise ValueError("L'onglet 'N' est obligatoire.")
-    df_n1 = read_hours_sheet(xls, "N-1")  # optionnel
+    df_n1 = read_hours_sheet(xls, "N-1")
     return df_n, df_n1
+
+# =========================
+# Export Word / PDF
+# =========================
+def build_summary_payload(
+    use_n1: bool,
+    ca_n: float, achats_n: float, taux_horaire_n: float, coef_refact_n: float, res_n: dict,
+    ca_n1: float | None, achats_n1: float | None, taux_horaire_n1: float | None, coef_refact_n1: float | None, res_n1: dict | None,
+):
+    """Structure stable pour exporter (Word/PDF)."""
+    payload = {
+        "date": dt.date.today().strftime("%d/%m/%Y"),
+        "N": {
+            "ca": ca_n,
+            "achats": achats_n,
+            "taux_horaire": taux_horaire_n,
+            "coef_refact": coef_refact_n,
+            "res": res_n,
+        },
+        "N-1": None,
+        "use_n1": bool(use_n1 and res_n1 is not None),
+    }
+    if payload["use_n1"]:
+        payload["N-1"] = {
+            "ca": ca_n1,
+            "achats": achats_n1,
+            "taux_horaire": taux_horaire_n1,
+            "coef_refact": coef_refact_n1,
+            "res": res_n1,
+        }
+    return payload
+
+def add_docx_kv_table(doc: Document, title: str, rows: list[tuple[str, str]]):
+    doc.add_heading(title, level=2)
+    table = doc.add_table(rows=1, cols=2)
+    hdr = table.rows[0].cells
+    hdr[0].text = "Indicateur"
+    hdr[1].text = "Valeur"
+
+    for k, v in rows:
+        r = table.add_row().cells
+        r[0].text = str(k)
+        r[1].text = str(v)
+
+def add_docx_hours_table(doc: Document, title: str, dfh: pd.DataFrame):
+    doc.add_heading(title, level=2)
+    df_show = dfh.copy()
+    # arrondis propres
+    for col in ["Heures", "Coef_production", "Heures_facturables"]:
+        df_show[col] = pd.to_numeric(df_show[col], errors="coerce").fillna(0.0)
+
+    table = doc.add_table(rows=1, cols=4)
+    hdr = table.rows[0].cells
+    hdr[0].text = "Personne"
+    hdr[1].text = "Heures"
+    hdr[2].text = "Coef production"
+    hdr[3].text = "Heures facturables"
+
+    for _, row in df_show.iterrows():
+        r = table.add_row().cells
+        r[0].text = str(row.get("Personne", ""))
+        r[1].text = f"{float(row.get('Heures', 0.0)):.2f}"
+        r[2].text = f"{float(row.get('Coef_production', 0.0)):.2f}"
+        r[3].text = f"{float(row.get('Heures_facturables', 0.0)):.2f}"
+
+def generate_docx_report(payload: dict) -> bytes:
+    doc = Document()
+
+    # Style simple
+    style = doc.styles["Normal"]
+    style.font.name = "Calibri"
+    style.font.size = Pt(11)
+
+    title = doc.add_paragraph("Récapitulatif — Rapprochement CA / Achats / Heures (Bâtiment)")
+    title.runs[0].bold = True
+    title.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    doc.add_paragraph(f"Date : {payload['date']}").alignment = WD_ALIGN_PARAGRAPH.CENTER
+
+    doc.add_paragraph(" ")
+
+    def section_for(label: str, block: dict):
+        res = block["res"]
+        doc.add_heading(f"Année {label}", level=1)
+
+        add_docx_kv_table(
+            doc,
+            "Paramètres",
+            [
+                ("Taux horaire", f"{block['taux_horaire']:.2f} €/h"),
+                ("Coef refacturation achats", f"{block['coef_refact']:.2f}"),
+            ],
+        )
+
+        add_docx_kv_table(
+            doc,
+            "Données & résultats",
+            [
+                ("Chiffre d'affaires (réel)", fmt_eur(block["ca"])),
+                ("Achats", fmt_eur(block["achats"])),
+                ("Marge (CA - Achats)", fmt_eur(res["marge"])),
+                ("Taux de marge", fmt_pct(res["tx_marge"])),
+                ("Heures totales", f"{res['heures']:.2f} h"),
+                ("Heures facturables", f"{res['heures_fact']:.2f} h"),
+                ("CA théorique achats", fmt_eur(res["ca_theo_achats"])),
+                ("CA théorique heures", fmt_eur(res["ca_theo_heures"])),
+                ("CA théorique total", fmt_eur(res["ca_theo_total"])),
+                ("Écart (réel - théorique)", fmt_eur(res["ecart"])),
+                ("Écart (%)", fmt_pct(res["ecart_pct"])),
+            ],
+        )
+
+        add_docx_hours_table(doc, "Détail heures par personne", res["dfh"])
+        doc.add_page_break()
+
+    section_for("N", payload["N"])
+    if payload["use_n1"]:
+        section_for("N-1", payload["N-1"])
+
+    # Remove last page break if it exists (simple heuristic)
+    # (optional; leave as-is if you don't care)
+    out = io.BytesIO()
+    doc.save(out)
+    return out.getvalue()
+
+def pdf_draw_kv(c: canvas.Canvas, x: float, y: float, key: str, val: str, key_w: float = 7.0*cm):
+    c.setFont("Helvetica", 10)
+    c.drawString(x, y, key)
+    c.setFont("Helvetica-Bold", 10)
+    c.drawString(x + key_w, y, val)
+
+def pdf_draw_table_hours(c: canvas.Canvas, x: float, y: float, dfh: pd.DataFrame, max_rows: int = 28):
+    # Header
+    c.setFont("Helvetica-Bold", 10)
+    c.drawString(x, y, "Personne")
+    c.drawString(x + 8.5*cm, y, "Heures")
+    c.drawString(x + 11.0*cm, y, "Coef")
+    c.drawString(x + 13.0*cm, y, "Heures fact.")
+    y -= 0.5*cm
+    c.setLineWidth(0.5)
+    c.line(x, y, x + 18.0*cm, y)
+    y -= 0.35*cm
+
+    c.setFont("Helvetica", 9)
+    df_show = dfh.copy()
+    for col in ["Heures", "Coef_production", "Heures_facturables"]:
+        df_show[col] = pd.to_numeric(df_show[col], errors="coerce").fillna(0.0)
+
+    rows = 0
+    for _, r in df_show.iterrows():
+        if rows >= max_rows:
+            return y, True  # overflow
+        c.drawString(x, y, str(r.get("Personne", ""))[:45])
+        c.drawRightString(x + 10.3*cm, y, f"{float(r.get('Heures', 0.0)):.2f}")
+        c.drawRightString(x + 12.6*cm, y, f"{float(r.get('Coef_production', 0.0)):.2f}")
+        c.drawRightString(x + 17.8*cm, y, f"{float(r.get('Heures_facturables', 0.0)):.2f}")
+        y -= 0.45*cm
+        rows += 1
+
+    return y, False
+
+def generate_pdf_report(payload: dict) -> bytes:
+    buf = io.BytesIO()
+    c = canvas.Canvas(buf, pagesize=A4)
+    width, height = A4
+
+    def cover_page():
+        c.setFont("Helvetica-Bold", 16)
+        c.drawCentredString(width/2, height - 3.0*cm, "Récapitulatif — Rapprochement CA / Achats / Heures (Bâtiment)")
+        c.setFont("Helvetica", 11)
+        c.drawCentredString(width/2, height - 4.0*cm, f"Date : {payload['date']}")
+        c.setFont("Helvetica", 10)
+        c.drawString(2.0*cm, height - 6.0*cm,
+                     "Ce document présente un comparatif entre CA réel et CA théorique (Achats refacturés + Heures facturées).")
+        c.showPage()
+
+    def year_page(label: str, block: dict):
+        res = block["res"]
+        x = 2.0*cm
+        y = height - 2.3*cm
+
+        c.setFont("Helvetica-Bold", 14)
+        c.drawString(x, y, f"Année {label}")
+        y -= 0.9*cm
+
+        c.setFont("Helvetica-Bold", 12)
+        c.drawString(x, y, "Paramètres")
+        y -= 0.6*cm
+
+        pdf_draw_kv(c, x, y, "Taux horaire", f"{block['taux_horaire']:.2f} €/h"); y -= 0.5*cm
+        pdf_draw_kv(c, x, y, "Coef refacturation achats", f"{block['coef_refact']:.2f}"); y -= 0.8*cm
+
+        c.setFont("Helvetica-Bold", 12)
+        c.drawString(x, y, "Données & résultats")
+        y -= 0.6*cm
+
+        lines = [
+            ("Chiffre d'affaires (réel)", fmt_eur(block["ca"])),
+            ("Achats", fmt_eur(block["achats"])),
+            ("Marge (CA - Achats)", fmt_eur(res["marge"])),
+            ("Taux de marge", fmt_pct(res["tx_marge"])),
+            ("Heures totales", f"{res['heures']:.2f} h"),
+            ("Heures facturables", f"{res['heures_fact']:.2f} h"),
+            ("CA théorique achats", fmt_eur(res["ca_theo_achats"])),
+            ("CA théorique heures", fmt_eur(res["ca_theo_heures"])),
+            ("CA théorique total", fmt_eur(res["ca_theo_total"])),
+            ("Écart (réel - théorique)", fmt_eur(res["ecart"])),
+            ("Écart (%)", fmt_pct(res["ecart_pct"])),
+        ]
+        for k, v in lines:
+            pdf_draw_kv(c, x, y, k, v)
+            y -= 0.5*cm
+
+        y -= 0.2*cm
+        c.setFont("Helvetica-Bold", 12)
+        c.drawString(x, y, "Détail heures par personne")
+        y -= 0.7*cm
+
+        # Table hours, multi-pages if needed
+        overflow = True
+        dfh = res["dfh"]
+        while overflow:
+            y, overflow = pdf_draw_table_hours(c, x, y, dfh, max_rows=28)
+            if overflow:
+                c.showPage()
+                y = height - 2.3*cm
+                c.setFont("Helvetica-Bold", 12)
+                c.drawString(x, y, f"Année {label} — Détail heures (suite)")
+                y -= 0.9*cm
+
+        c.showPage()
+
+    cover_page()
+    year_page("N", payload["N"])
+    if payload["use_n1"]:
+        year_page("N-1", payload["N-1"])
+
+    c.save()
+    return buf.getvalue()
 
 # =========================
 # Default session state
@@ -206,7 +452,7 @@ with right:
                 st.session_state["hours_n"] = df_n.copy()
                 if df_n1 is not None:
                     st.session_state["hours_n1"] = df_n1.copy()
-                st.success("Import OK ✅ Les tableaux ont été rechargés. Tu peux ensuite modifier manuellement.")
+                st.success("Import OK ✅ Tableaux rechargés. Tu peux ensuite modifier manuellement.")
             except Exception as e:
                 st.error(f"Import impossible : {e}")
 
@@ -251,7 +497,7 @@ with c2:
 st.divider()
 
 # =========================
-# 2) Heures – Edition manuelle (toujours possible)
+# 2) Heures – Edition manuelle
 # =========================
 st.subheader("2️⃣ Heures par personne (modifiable manuellement)")
 
@@ -303,7 +549,7 @@ if use_n1 and ca_n1 is not None and achats_n1 is not None:
     res_n1 = compute_year(ca_n1, achats_n1, st.session_state["hours_n1"], taux_horaire_n1, coef_refact_n1)
 
 # =========================
-# KPI
+# 3) KPI
 # =========================
 st.subheader("3️⃣ Résultats")
 
@@ -328,7 +574,6 @@ st.divider()
 # =========================
 st.subheader("4️⃣ Analyse graphique")
 
-# --- CA réel vs CA théorique (groupé)
 rows = [
     {"Année": "N", "Type": "CA réel", "Montant": float(ca_n)},
     {"Année": "N", "Type": "CA théorique", "Montant": float(res_n["ca_theo_total"])},
@@ -364,7 +609,6 @@ labels_ca = (
     )
 )
 
-# --- Écart (réel - théorique)
 gap_rows = [{"Année": "N", "Écart": float(res_n["ecart"])}]
 if res_n1 is not None:
     gap_rows.append({"Année": "N-1", "Écart": float(res_n1["ecart"])})
@@ -378,8 +622,8 @@ gap_bar = (
         y=alt.Y("Écart:Q", title="Écart (€)"),
         color=alt.condition(
             alt.datum["Écart"] >= 0,
-            alt.value("#2e7d32"),  # vert
-            alt.value("#c62828"),  # rouge
+            alt.value("#2e7d32"),
+            alt.value("#c62828"),
         ),
         tooltip=[alt.Tooltip("Année:N"), alt.Tooltip("Écart:Q", format=",.0f")],
     )
@@ -397,7 +641,6 @@ gap_labels = (
     )
 )
 
-# --- Composition du CA théorique (empilé)
 comp_rows = [
     {"Année": "N", "Composant": "Achats / revente", "Montant": float(res_n["ca_theo_achats"])},
     {"Année": "N", "Composant": "Heures", "Montant": float(res_n["ca_theo_heures"])},
@@ -444,8 +687,39 @@ st.markdown("### Composition du CA théorique")
 st.altair_chart((chart_comp + labels_comp).properties(height=360), use_container_width=True)
 
 # =========================
-# Détails (tables calculées)
+# 5) Export Word / PDF
 # =========================
+st.divider()
+st.subheader("5️⃣ Export récap (Word / PDF)")
+
+payload = build_summary_payload(
+    use_n1=use_n1,
+    ca_n=ca_n, achats_n=achats_n, taux_horaire_n=taux_horaire_n, coef_refact_n=coef_refact_n, res_n=res_n,
+    ca_n1=ca_n1, achats_n1=achats_n1, taux_horaire_n1=taux_horaire_n1, coef_refact_n1=coef_refact_n1, res_n1=res_n1,
+)
+
+colW, colP = st.columns(2)
+
+with colW:
+    docx_bytes = generate_docx_report(payload)
+    st.download_button(
+        "📝 Télécharger le récap Word (.docx)",
+        data=docx_bytes,
+        file_name=f"recap_ca_achats_heures_{dt.date.today().strftime('%Y%m%d')}.docx",
+        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        use_container_width=True,
+    )
+
+with colP:
+    pdf_bytes = generate_pdf_report(payload)
+    st.download_button(
+        "🧾 Télécharger le récap PDF",
+        data=pdf_bytes,
+        file_name=f"recap_ca_achats_heures_{dt.date.today().strftime('%Y%m%d')}.pdf",
+        mime="application/pdf",
+        use_container_width=True,
+    )
+
 with st.expander("Détails des heures (avec heures facturables)"):
     st.markdown("#### N")
     st.dataframe(res_n["dfh"], use_container_width=True)
